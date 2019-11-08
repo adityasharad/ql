@@ -14,37 +14,9 @@ import java
 import semmle.code.java.dataflow.FlowSources
 import semmle.code.java.dataflow.TaintTracking2
 import semmle.code.java.security.XSS
+import JSP
 import DataFlow2::PathGraph
 
-/**
- * The method `proprietaryEvaluate` declared in `org.apache.jasper.runtime.PageContextImpl`.
- * This is used to evaluate JSP Expression Language (EL) expressions
- * present on a page.
- * See https://tomcat.apache.org/tomcat-7.0-doc/api/org/apache/jasper/runtime/PageContextImpl.html#proprietaryEvaluate.
- */
-class ProprietaryEvaluateMethod extends Method {
-  ProprietaryEvaluateMethod() {
-    getDeclaringType().hasQualifiedName("org.apache.jasper.runtime", "PageContextImpl") and
-    hasName("proprietaryEvaluate")
-  }
-}
-
-class JspParamFlowSource extends RemoteFlowSource {
-  JspParamFlowSource() { this.asExpr().(StringLiteral).getValue().matches("${param.%}%") }
-
-  override string getSourceType() { result = "JSP parameter" }
-}
-
-// class JspTaintStep extends TaintTracking2::AdditionalTaintStep {
-//   override predicate step(DataFlow::Node source, DataFlow::Node target) {
-//     // x -> proprietaryEvaluate(x, ...)
-//     exists(MethodAccess call |
-//       call.getArgument(0) = source.asExpr() and
-//       call = target.asExpr() and
-//       call.getMethod() instanceof ProprietaryEvaluateMethod
-//     )
-//   }
-// }
 class XSSConfig extends TaintTracking2::Configuration {
   XSSConfig() { this = "XSSConfig" }
 
@@ -54,14 +26,6 @@ class XSSConfig extends TaintTracking2::Configuration {
 
   override predicate isSanitizer(DataFlow::Node node) {
     node.getType() instanceof NumericType or node.getType() instanceof BooleanType
-  }
-
-  override predicate isAdditionalTaintStep(DataFlow::Node source, DataFlow::Node target) {
-    exists(MethodAccess call |
-      call.getArgument(0) = source.asExpr() and
-      call = target.asExpr() and
-      call.getMethod() instanceof ProprietaryEvaluateMethod
-    )
   }
 }
 
