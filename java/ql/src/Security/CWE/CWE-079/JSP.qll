@@ -2,6 +2,7 @@ import java
 import semmle.code.java.frameworks.Servlets
 import semmle.code.java.dataflow.TaintTracking
 import semmle.code.java.dataflow.FlowSources
+import semmle.code.java.security.XSS
 
 /**
  * The interface `javax.servlet.RequestDispatcher`.
@@ -118,6 +119,7 @@ private class RequestDispatcherTaintStep extends TaintTracking::AdditionalTaintS
       DataFlow::localFlow(DataFlow::parameterNode(requestParameter),
         DataFlow::exprNode(getAttributeCall.getQualifier())) and
       // Find the name of the attribute accessed by the `GetAttributeCall(...)` call.
+      // TODO there might not be a getAttribute call, it could just be a ${attribute} that goes through proprietaryEvaluate
       getAttributeCall.getAttributeName() = attributeName and
       // Add flow from the expression set as the value of the attribute to the `GetAttributeCall(...)` call.
       fromNode.asExpr() = forwardCall.getASetAttributeValue(attributeName) and
@@ -239,3 +241,124 @@ string getGeneratedJspJavaClassName(string jspFileName) {
     result = stem + "_jsp"
   )
 }
+
+/** The class `javax.servlet.jsp.JspContext`. */
+class JspContext extends RefType {
+  JspContext() { this.hasQualifiedName("javax.servlet.jsp", "JspContext") }
+}
+
+/** The method `javax.servlet.jsp.JspContext.getOut()`. */
+class JspContextGetOutMethod extends Method {
+  JspContextGetOutMethod() {
+    this.getDeclaringType() instanceof JspContext and
+    this.hasName("getOut")
+  }
+}
+
+/**
+ * A call that writes its argument to a JSP writer.
+ * Any content written to a JSP page goes through
+ * such a call in the generated Java code.
+ */
+class JspWrite extends MethodAccess {
+  JspWrite() {
+    exists(MethodAccess getOutCall, string name |
+      // JspContext.getOut() is used to obtain a writer.
+      getOutCall = any(JspContextGetOutMethod m).getAReference() and
+      // The writer is within the service method generated for a JSP page.
+      getOutCall.getEnclosingCallable() instanceof JspServiceMethod and
+      // The writer is used as the qualifier of this call.
+      DataFlow::localFlow(DataFlow::exprNode(getOutCall), DataFlow::exprNode(this.getQualifier())) and
+      // This call is to a write method on the writer.
+      this.getMethod().hasName(name) and
+      (name = "write" or name = "print")
+    )
+  }
+}
+
+/** 
+ * Content written to a JSP page.
+ * TODO: associated with JspGeneratedClass.
+ */
+newtype TJspContent = 
+TJspConstantContent(CompileTimeConstantExpr e) {
+  e instanceof JspWrittenContent
+}
+or
+TJspExpressionLanguageContent(MethodAccess proprietaryEvaluateCall, CompileTimeConstantExpr e) {
+  proprietaryEvaluateCall.getMethod() instanceof ProprietaryEvaluateMethod and
+  TaintTracking::localTaint(DataFlow::exprNode(proprietaryEvaluateCall), DataFlow::exprNode(any(JspWrittenContent c))) and
+  e = proprietaryEvaluateCall.getArgument(0)
+}
+or
+TJspJavaStatement(Stmt s) {
+  s = any(JspGeneratedClass c).getAWrittenStatement() and
+  not s = any(JspWrittenContent content).getEnclosingStmt()
+}
+
+
+class JspWrittenContent extends Expr {
+  JspWrittenContent() {
+    this = any(JspWrite write).getAnArgument()
+  }
+}
+
+/** A class generated from a JSP page. */
+class JspGeneratedClass extends Class {
+  JspGeneratedClass() {
+    this.getName().matches("%_jsp")
+  }
+
+  JspServiceMethod getServiceMethod() {
+    result = this.getAMethod()
+  }
+
+  JspWrite getAWrite() {
+    result.getEnclosingCallable() = this.getServiceMethod()
+  }
+
+  JspWrite getFirstWrite() {
+    // We assume that the first element on the page is the opening <html> tag.
+    // This implies the generated code for the page content starts with a write call
+    // rather than Java that is embedded on the page.
+    result = min(JspWrite write | write = this.getAWrite() | write order by write.getLocation().getStartLine())
+  }
+
+  JspWrite getLastWrite() {
+    // We assume that the last element on the page is the closing </html> tag.
+    // This implies the generated code for the page content ends with a write call
+    // rather than Java that is embedded on the page.
+    result = max(JspWrite write | write = this.getAWrite() | write order by write.getLocation().getStartLine())
+  }
+
+  predicate generatedLineRange(int start, int end) {
+    start = this.getFirstWrite().getLocation().getStartLine() and
+    end = this.getLastWrite().getLocation().getEndLine()
+  }
+
+  Stmt getAWrittenStatement() {
+    exists(int start, int end |
+      this.generatedLineRange(start, end) and
+      result.getEnclosingCallable() = this.getServiceMethod() and
+      start <= result.getLocation().getStartLine() and
+      end >= result.getLocation().getEndLine()
+    )
+  }
+
+  int getNumberOfLinesSpanned(TJspContent c) {
+    exists(CompileTimeConstantExpr e |
+      c = TJspConstantContent(e) and
+      result = count(e.getStringValue().indexOf("\n")) + 1
+    )
+    or
+    c = TJspExpressionLanguageContent(_, _) and
+    result = 1 // assumes attribute expressions cannot span multiple lines
+    or
+    exists(Stmt s |
+      c = TJspJavaStatement(s) and
+      result = s.getTotalNumberOfLines()
+    )
+  }
+}
+
+
