@@ -92,14 +92,13 @@ class ProprietaryEvaluateMethod extends Method {
 
 /** A call to `org.apache.jasper.runtime.PageContextImpl.proprietaryEvaluate`. */
 class ProprietaryEvaluateCall extends MethodAccess {
-  ProprietaryEvaluateCall() { getMethod() instanceof ProprietaryEvaluateMethod }
+  ProprietaryEvaluateCall() {
+    getMethod() instanceof ProprietaryEvaluateMethod
+  }
 
-  /** Gets the EL string literal of the form `${...}` that is evaluated by this call. */
-  StringLiteral getEvaluatedArgument() { result = this.getArgument(0) }
-
-  /** Gets the named EL expression that is evaluated by this call. */
-  string getEvaluatedAttributeName() {
-    this.getEvaluatedArgument().getValue() = "${" + result + "}"
+  /** Gets the EL string that is evaluated by this call. */
+  Expr getEvaluatedArgument() {
+    result = this.getArgument(0)
   }
 }
 
@@ -114,33 +113,10 @@ class JspParamFlowSource extends RemoteFlowSource {
 private class JspProprietaryEvaluateTaintStep extends TaintTracking::AdditionalTaintStep {
   override predicate step(DataFlow::Node source, DataFlow::Node target) {
     exists(ProprietaryEvaluateCall call |
-      call.getEvaluatedArgument() = source.asExpr() and
+      call.getArgument(0) = source.asExpr() and
       call = target.asExpr()
     )
   }
-}
-
-private class JspAttributeRead extends Expr {
-  Parameter requestParameter;
-  string attributeName;
-
-  JspAttributeRead() {
-    exists(GetAttributeCall getAttributeCall | getAttributeCall = this |
-      DataFlow::localFlow(DataFlow::parameterNode(requestParameter),
-        DataFlow::exprNode(getAttributeCall.getQualifier())) and
-      getAttributeCall.getAttributeName() = attributeName
-    )
-    or
-    exists(ProprietaryEvaluateCall proprietaryEvaluateCall | proprietaryEvaluateCall = this |
-      requestParameter = proprietaryEvaluateCall
-            .getEnclosingCallable()
-            .(JspServiceMethod)
-            .getAParameter() and
-      proprietaryEvaluateCall.getEvaluatedAttributeName() = attributeName
-    )
-  }
-  Parameter getRequestParameter() { result = requestParameter }
-  string getAttributeName() { result = attributeName }
 }
 
 /** Taint tracking step through request forwarding via a `RequestDispatcher`. */
@@ -148,19 +124,19 @@ private class RequestDispatcherTaintStep extends TaintTracking::AdditionalTaintS
   override predicate step(DataFlow::Node fromNode, DataFlow::Node toNode) {
     exists(
       RequestDispatcherForwardCall forwardCall, string attributeName, Parameter requestParameter,
-      JspAttributeRead attributeRead, Expr attributeWrite
+      GetAttributeCall getAttributeCall
     |
-      // Find the request parameter of the target of the `forward` call.
+      // Find the request parameter to the target of the `forward` call.
       requestParameter = forwardCall.getAPossibleServlet().getAHandlerMethod().getRequestParameter() and
-      // Find where an attribute of the request parameter is read.
-      requestParameter = attributeRead.getRequestParameter() and
-      // Find the name of the attribute that is read.
-      attributeRead.getAttributeName() = attributeName and
-      // Find where the same attribute is written before the forward call.
-      attributeWrite = forwardCall.getASetAttributeValue(attributeName) and
-      // Add flow from the write to the read.
-      fromNode.asExpr() = attributeWrite and
-      toNode.asExpr() = attributeRead
+      // Find flow from the parameter to the qualifier of a `GetAttributeCall(...)` call.
+      DataFlow::localFlow(DataFlow::parameterNode(requestParameter),
+        DataFlow::exprNode(getAttributeCall.getQualifier())) and
+      // Find the name of the attribute accessed by the `GetAttributeCall(...)` call.
+      // TODO there might not be a getAttribute call, it could just be a ${attribute} that goes through proprietaryEvaluate
+      getAttributeCall.getAttributeName() = attributeName and
+      // Add flow from the expression set as the value of the attribute to the `GetAttributeCall(...)` call.
+      fromNode.asExpr() = forwardCall.getASetAttributeValue(attributeName) and
+      toNode.asExpr() = getAttributeCall
     )
   }
 }
@@ -293,215 +269,12 @@ class JspContextGetOutMethod extends Method {
   }
 }
 
-predicate testLoc(Raw::HtmlContent c, Expr e) { c.getGeneratedCode() = e }
+module JspGeneratedCode {
+  predicate testLoc(JspHtmlContent c, Expr e) { c.getGeneratedCode() = e }
 
-predicate testFile(File f, string name) {
-  f.getExtension() = "jsp" and
-  name = f.getBaseName()
-}
-
-// Known correspondence between JSP and generated Java, when JSP is compiled by Tomcat and the Jetty JSPC Maven plugin:
-// - Regular HTML turns into string literals written to the JspWriter.
-//   e.g. `<html>\n<body>...` becomes `out.write("<html>\n<body>...");`
-//   Note that multiple successive lines of HTML may be combined into a single string.
-// - JSP Expression Language includes turn into string literals passed to proprietaryEvaluate and then the JspWriter.
-//   e.g. `${param.id}` becomes `out.write((String) proprietaryEvaluate("${param.id}", ...));
-// - JSP scriptlets are fragments of Java code (statements). These are preserved as statements in the generated code (note that scriptlets may be interspersed with non-scriptlet tags.)
-//   e.g.`<% String p = request.getParameter("p"); %>` becomes `String p = request.getParameter("p");`.
-// - JSP expressions are preserved as expressions in the generated code, which are printed to the JspWriter.
-//   e.g. `<%= attribute %>` becomes `out.print( attribute );`
-// - [Not supported] JSP directives
-/** Models elements in raw JSP source. */
-private module Raw {
-  private newtype TJspElement =
-    THtmlContent(Generated::HtmlContent c) or
-    TExpressionLanguageExpr(Generated::ExpressionLanguageExpr c) or
-    TExpression(Generated::Expression e) or
-    TScriptletStmt(Generated::ScriptletStmt s)
-
-  /**
-   * Content written to a JSP page.
-   */
-  class JspElement extends TJspElement {
-    abstract string toString();
-
-    predicate hasLocationInfo(string filePath, int startLine, int startCol, int endLine, int endCol) {
-      // TODO
-      filePath = "C:/semmle/code/ql/java/ql/test/query-tests/security/CWE-079/semmle/tests/maven-project/src/main/webapp/XssJsp.jsp" and
-      startLine = this.getStartLine() and
-      endLine = this.getEndLine() and
-      // It is possible to compute narrower locations by keeping track of the
-      // start and end column positions of each element in sequence.
-      // This is error-prone because of variations in whitespace and JSP tags.
-      // For simplicity, just report locations on the entire line.
-      startCol = 1 and
-      endCol = 9999 // chosen to be long enough to span most line lengths
-    }
-
-    final int getStartLine() {
-      result =
-        // The number of lines spanned by all preceding written statements
-        // in the same generated class.
-        // TODO quadratic
-        sum(Generated::JavaElement prevElement, Generated::JspWrittenStmt prevStmt |
-            prevStmt = this.getGeneratedCodeStmt().getGeneratedClass().getAWrittenStatement() and
-            prevStmt.getWrittenStmtRank() < this.getGeneratedCodeStmt().getWrittenStmtRank() and
-            prevElement.getWrittenStmt() = prevStmt
-          |
-            prevElement.getEndLineRelativeOffset()
-          ) +
-          // 1-based
-          1
-    }
-
-    final int getEndLine() {
-      result = this.getStartLine() + this.getGeneratedCode().getEndLineRelativeOffset()
-    }
-
-    abstract Generated::JavaElement getGeneratedCode();
-
-    final Generated::JspWrittenStmt getGeneratedCodeStmt() {
-      result = this.getGeneratedCode().getWrittenStmt()
-    }
-  }
-
-  class HtmlContent extends JspElement, THtmlContent {
-    Generated::HtmlContent c;
-
-    HtmlContent() { this = THtmlContent(c) }
-
-    override string toString() { result = "JSP HTML content" }
-
-    override Generated::HtmlContent getGeneratedCode() { result = c }
-  }
-
-  class Expression extends JspElement, TExpression {
-    Generated::Expression e;
-
-    Expression() { this = TExpression(e) }
-
-    override string toString() { result = "JSP expression" }
-
-    override Generated::Expression getGeneratedCode() { result = e }
-  }
-
-  class ExpressionLanguageExpr extends JspElement, TExpressionLanguageExpr {
-    Generated::ExpressionLanguageExpr e;
-
-    ExpressionLanguageExpr() { this = TExpressionLanguageExpr(e) }
-
-    override string toString() { result = "JSP EL expression" }
-
-    override Generated::ExpressionLanguageExpr getGeneratedCode() { result = e }
-  }
-
-  class ScriptletStmt extends JspElement, TScriptletStmt {
-    Generated::ScriptletStmt s;
-
-    ScriptletStmt() { this = TScriptletStmt(s) }
-
-    override string toString() { result = "JSP scriptlet statement" }
-
-    override Generated::ScriptletStmt getGeneratedCode() { result = s }
-  }
-}
-
-predicate test(Raw::JspElement c, Generated::JavaElement e) { c.getGeneratedCode() = e }
-
-/** TODO Override locations without breaking performance. */
-
-/** Models Java elements generated by compiling raw JSP source. */
-private module Generated {
-  /** A generated Java source code element that directly corresponds to a JSP element. */
-  abstract class JavaElement extends Top {
-    JspWrittenStmt writtenStmt;
-
-    final JspWrittenStmt getWrittenStmt() { result = writtenStmt }
-
-    /** Gets the difference between the 1-based inclusive end and start lines of the corresponding JSP element. */
-    abstract int getEndLineRelativeOffset();
-  }
-
-  class HtmlContent extends JavaElement, CompileTimeConstantExpr, JspWrittenContent {
-    HtmlContent() { writtenStmt = this.getEnclosingStmt() }
-
-    override int getEndLineRelativeOffset() { result = count(this.getStringValue().indexOf("\n")) }
-  }
-
-  class ExpressionLanguageExpr extends JavaElement, CompileTimeConstantExpr {
-    MethodAccess proprietaryEvaluateCall;
-
-    ExpressionLanguageExpr() {
-      // The `proprietaryEvaluate` call actually flows into the argument of `write`, but this is enough for now.
-      writtenStmt = this.getEnclosingStmt() and
-      proprietaryEvaluateCall.getMethod() instanceof ProprietaryEvaluateMethod and
-      this = proprietaryEvaluateCall.getArgument(0)
-    }
-
-    override int getEndLineRelativeOffset() {
-      // assumes these are never multiline
-      result = 0
-    }
-  }
-
-  /** A Java expression generated from JSP `<%= ... %>` expression syntax. */
-  class Expression extends JavaElement, JspWrittenContent {
-    Expression() {
-      writtenStmt = this.getEnclosingStmt() and
-      // Assumes that expression syntax isn't used to store constants.
-      // TODO: Remove this, and distinguish by looking for `out.print`.
-      not this instanceof CompileTimeConstantExpr and
-      // Exclude EL expressions: those are modelled separately.
-      not exists(ProprietaryEvaluateMethod m |
-        DataFlow::localFlow(DataFlow::exprNode(m.getAReference()), DataFlow::exprNode(this))
-      )
-    }
-
-    override int getEndLineRelativeOffset() {
-      // Assume a single line.
-      result = 0
-      // result = this.getLocation().getNumberOfLines() - 1
-    }
-  }
-
-  /** A Java statement generated from JSP `<% ... %>` scriptlet syntax. */
-  class ScriptletStmt extends JavaElement, JspWrittenStmt {
-    ScriptletStmt() {
-      writtenStmt = this and
-      // Not one of the `out.write/print` calls, but a regular Java statement within the same block.
-      not this = any(JspWriteCall w).getEnclosingStmt()
-    }
-
-    override int getEndLineRelativeOffset() { result = this.getLocation().getNumberOfLines() - 1 }
-  }
-
-  class JspWrittenContent extends Expr {
-    JspWrittenContent() { this = any(JspWriteCall write).getAnArgument() }
-  }
-
-  class JspConstantWrittenContent extends JspWrittenContent, CompileTimeConstantExpr { }
-
-  class JspWrittenStmt extends Stmt {
-    JspGeneratedClass c;
-
-    JspWrittenStmt() { this = c.getAWrittenStatement() }
-
-    JspGeneratedClass getGeneratedClass() { result = c }
-
-    /**
-     * Gets the 1-based index of this JSP statement in the sequence of all JSP statements in the
-     * same generated servlet method.
-     */
-    int getWrittenStmtRank() {
-      this = rank[result](JspWrittenStmt s |
-          s = c.getAWrittenStatement()
-        |
-          s order by s.getLocation().getStartLine()
-        )
-    }
-
-    /** Gets a constant expression written in this statement, if any. */
-    JspConstantWrittenContent getWrittenConstant() { result.getEnclosingStmt() = this }
+  predicate testFile(File f, string name) {
+    f.getExtension() = "jsp" and
+    name = f.getBaseName()
   }
 
   /**
@@ -526,11 +299,291 @@ private module Generated {
   }
 
   class JspWriteCall extends JspWriterCall {
-    JspWriteCall() { this.getMethod().hasName("write") }
+    JspWriteCall() { this.getMethod().hasName("write")}
   }
 
   class JspPrintCall extends JspWriterCall {
-    JspPrintCall() { this.getMethod().hasName("print") }
+    JspPrintCall() { this.getMethod().hasName("print")}
+  }
+
+  /** Unused for now. */
+  private module JspLocationColumns {
+    int getStartColumn(JspContent c) {
+      exists(int r | r = c.getGeneratedCodeStmt().getWrittenStmtRank() |
+        // The first element starts at the beginning of the file.
+        r = 1 and result = 1
+        or
+        // Otherwise, start where the previous element ends.
+        r > 1 and
+        exists(JspContent prevContent, JspWrittenStmt prevStmt |
+          prevStmt = c.getGeneratedCodeStmt().getGeneratedClass().getAWrittenStatement() and
+          prevStmt.getWrittenStmtRank() = r - 1 and
+          prevContent.getGeneratedCodeStmt() = prevStmt and
+          result = prevContent.getEndColumn() + 1
+        )
+      )
+    }
+  }
+
+  // Known correspondence between JSP and generated Java, when JSP is compiled by Tomcat and the Jetty JSPC Maven plugin:
+  // - Regular HTML turns into string literals written to the JspWriter.
+  //   e.g. `<html>\n<body>...` becomes `out.write("<html>\n<body>...");`
+  //   Note that multiple successive lines of HTML may be combined into a single string.
+  // - JSP Expression Language includes turn into string literals passed to proprietaryEvaluate and then the JspWriter.
+  //   e.g. `${param.id}` becomes `out.write((String) proprietaryEvaluate("${param.id}", ...));
+  // - JSP scriptlets are fragments of Java code (statements). These are preserved as statements in the generated code (note that scriptlets may be interspersed with non-scriptlet tags.)
+  //   e.g.`<% String p = request.getParameter("p"); %>` becomes `String p = request.getParameter("p");`.
+  // - JSP expressions are preserved as expressions in the generated code, which are printed to the JspWriter.
+  //   e.g. `<%= attribute %>` becomes `out.print( attribute );`
+  // - [Not supported] JSP directives
+
+  /**
+   * Content written to a JSP page.
+   */
+  private newtype TJspContent =
+    TJspHtmlContent(Generated::HtmlContent c) or
+    TJspExpressionLanguageExpr(Generated::ExpressionLanguageExpr c) or
+    TJspExpression(Generated::Expression e) or
+    TJspScriptletStmt(Generated::ScriptletStmt s)
+
+
+  predicate test(JspContent c, Generated::JavaElement e) {
+    c.getGeneratedCode() = e
+  }
+
+  abstract class JspContent extends TJspContent {
+    abstract string toString();
+
+    predicate hasLocationInfo(string filePath, int startLine, int startCol, int endLine, int endCol) {
+      // TODO
+      filePath = "C:/semmle/code/ql/java/ql/test/query-tests/security/CWE-079/semmle/tests/maven-project/src/main/webapp/XssJsp.jsp" and
+      startLine = this.getStartLine() and
+      endLine = this.getEndLine() and
+      // It is possible to compute narrower locations by keeping track of the
+      // start and end column positions of each element in sequence.
+      // This is error-prone because of variations in whitespace and JSP tags.
+      // For simplicity, just report locations on the entire line.
+      startCol = 1 and
+      endCol = 9999 // chosen to be long enough to span most line lengths
+    }
+
+    final int getStartLine() {
+      result =
+        // The number of lines spanned by all preceding written statements
+        // in the same generated class.
+        sum(Generated::JavaElement prevElement, JspWrittenStmt prevStmt |
+            prevStmt = this.getGeneratedCodeStmt().getGeneratedClass().getAWrittenStatement() and
+            prevStmt.getWrittenStmtRank() < this.getGeneratedCodeStmt().getWrittenStmtRank() and
+            prevElement.getWrittenStmt() = prevStmt
+          |
+            prevElement.getEndLineRelativeOffset()
+          ) +
+          // 1-based
+          1
+    }
+
+    final int getEndLine() {
+      result = this.getStartLine() + this.getGeneratedCode().getEndLineRelativeOffset()
+    }
+
+    final int getEndColumn() { result = this.getGeneratedCode().getLastLineLength() }
+
+    abstract Generated::JavaElement getGeneratedCode();
+
+    final JspWrittenStmt getGeneratedCodeStmt() {
+      result = this.getGeneratedCode().getWrittenStmt()
+    }
+  }
+
+  class JspHtmlContent extends JspContent, TJspHtmlContent {
+    Generated::HtmlContent c;
+
+    JspHtmlContent() { this = TJspHtmlContent(c) }
+
+    override string toString() { result = "JSP HTML content: " + c.getStringValue() }
+
+    override Generated::HtmlContent getGeneratedCode() { result = c }
+  }
+
+  class JspExpression extends JspContent, TJspExpression {
+    Generated::Expression e;
+
+    JspExpression() { this = TJspExpression(e) }
+
+    override string toString() { result = "JSP expression: " + e.toString() }
+
+    override Generated::Expression getGeneratedCode() { result = e }
+  }
+
+  class JspExpressionLanguageContent extends JspContent, TJspExpressionLanguageExpr {
+    Generated::ExpressionLanguageExpr e;
+
+    JspExpressionLanguageContent() { this = TJspExpressionLanguageExpr(e) }
+
+    override string toString() { result = "JSP EL expression: " + e.toString() }
+
+    override Generated::ExpressionLanguageExpr getGeneratedCode() { result = e }
+  }
+
+  class JspScriptletStmt extends JspContent, TJspScriptletStmt {
+    Generated::ScriptletStmt s;
+
+    JspScriptletStmt() { this = TJspScriptletStmt(s) }
+
+    override string toString() { result = "JSP scriptlet statement: " + s.toString() }
+
+    override Generated::ScriptletStmt getGeneratedCode() { result = s }
+  }
+
+  /** Override locations. */
+  class JspAstNode extends Top {
+    JspContent jspContent;
+    JspAstNode() {
+      jspContent.getGeneratedCode() = this
+    }
+
+    override predicate hasLocationInfo(string filePath, int startLine, int startColumn, int endLine, int endColumn) {
+      jspContent.hasLocationInfo(filePath, startLine, startColumn, endLine, endColumn)
+    }
+
+    override string toString() { result = jspContent.toString() }
+  }
+
+  class JspDataFlowNode extends DataFlow::Node {
+    JspContent jspContent;
+    JspDataFlowNode() {
+      jspContent.getGeneratedCode() = this.asExpr()
+    }
+
+    override predicate hasLocationInfo(string filePath, int startLine, int startColumn, int endLine, int endColumn) {
+      jspContent.hasLocationInfo(filePath, startLine, startColumn, endLine, endColumn)
+    }
+
+    override string toString() { result = jspContent.toString() }
+  }
+
+  private module Generated {
+    /** A generated Java source code element that directly corresponds to a JSP element. */
+    abstract class JavaElement extends Top {
+      JspWrittenStmt writtenStmt;
+
+      final JspWrittenStmt getWrittenStmt() { result = writtenStmt }
+
+      abstract int getEndLineRelativeOffset();
+
+      abstract int getLastLineLength();
+    }
+
+    predicate testGenerated(JavaElement e, int endLineOffset, int endLineLength) {
+      e.getEndLineRelativeOffset() = endLineOffset and
+      e.getLastLineLength() = endLineLength
+    }
+
+    class HtmlContent extends JavaElement, CompileTimeConstantExpr, JspWrittenContent {
+      HtmlContent() { writtenStmt = this.getEnclosingStmt() }
+
+      override int getEndLineRelativeOffset() {
+        result = count(this.getStringValue().indexOf("\n"))
+      }
+
+      override int getLastLineLength() {
+        result = this.getStringValue().regexpFind("([^\n])+$", _, _).length()
+      }
+    }
+
+    class ExpressionLanguageExpr extends JavaElement, CompileTimeConstantExpr {
+      MethodAccess proprietaryEvaluateCall;
+
+      ExpressionLanguageExpr() {
+        // The `proprietaryEvaluate` call actually flows into the argument of `write`, but this is enough for now.
+        writtenStmt = this.getEnclosingStmt() and
+        proprietaryEvaluateCall.getMethod() instanceof ProprietaryEvaluateMethod and
+        this = proprietaryEvaluateCall.getArgument(0)
+      }
+
+      override int getEndLineRelativeOffset() {
+        // assumes these are never multiline
+        result = 0
+      }
+
+      override int getLastLineLength() {
+        // Assume a single line.
+        result = this.getStringValue().length()
+        // If these were multiline, we would have to use:
+        // result = this.getStringValue().regexpFind("([^\n])+$", _, _).length()
+      }
+    }
+
+    /** A Java expression generated from JSP `<%= ... %>` expression syntax. */
+    class Expression extends JavaElement, JspWrittenContent {
+      Expression() {
+        writtenStmt = this.getEnclosingStmt() and
+        // Assumes that expression syntax isn't used to store constants.
+        // TODO: Remove this, and distinguish by looking for `out.print`.
+        not this instanceof CompileTimeConstantExpr and
+        // Exclude EL expressions: those are modelled separately.
+        not exists(ProprietaryEvaluateMethod m |
+          DataFlow::localFlow(DataFlow::exprNode(m.getAReference()), DataFlow::exprNode(this))
+        )
+      }
+
+      override int getEndLineRelativeOffset() {
+        // Assume a single line.
+        result = 0
+        // result = this.getLocation().getNumberOfLines() - 1
+      }
+
+      override int getLastLineLength() {
+        // Assume a single line.
+        result = this.getLocation().getEndColumn() - this.getLocation().getStartColumn() + 1
+      }
+    }
+
+    /** A Java statement generated from JSP `<% ... %>` scriptlet syntax. */
+    class ScriptletStmt extends JavaElement, JspWrittenStmt {
+      ScriptletStmt() {
+        writtenStmt = this and
+        // Not one of the `out.write/print` calls, but a regular Java statement within the same block.
+        not this = any(JspWriteCall w).getEnclosingStmt()
+      }
+
+      override int getEndLineRelativeOffset() { result = this.getLocation().getNumberOfLines() - 1 }
+
+      override int getLastLineLength() { result = this.getLocation().getEndColumn() }
+    }
+  }
+
+  class JspWrittenContent extends Expr {
+    JspWrittenContent() { this = any(JspWriteCall write).getAnArgument() }
+  }
+
+  class JspConstantWrittenContent extends JspWrittenContent, CompileTimeConstantExpr {
+    int getLastLineLength() {
+      result = this.getStringValue().regexpFind("([^\n])+$", _, _).length()
+    }
+  }
+
+  class JspWrittenStmt extends Stmt {
+    JspGeneratedClass c;
+
+    JspWrittenStmt() { this = c.getAWrittenStatement() }
+
+    JspGeneratedClass getGeneratedClass() { result = c }
+
+    /**
+     * Gets the 1-based index of this JSP statement in the sequence of all JSP statements in the
+     * same generated servlet method.
+     */
+    int getWrittenStmtRank() {
+      this = rank[result](JspWrittenStmt s |
+          s = c.getAWrittenStatement()
+        |
+          s order by s.getLocation().getStartLine()
+        )
+    }
+
+    /** Gets a constant expression written in this statement, if any. */
+    JspConstantWrittenContent getWrittenConstant() { result.getEnclosingStmt() = this }
   }
 
   /** A class generated from a JSP page. */
@@ -567,7 +620,7 @@ private module Generated {
 
     /**
      * Holds if the statements that write the JSP content for this generated class lie on lines
-     *     `[start..end]` (1-based, inclusive) of the class.
+     `[start..end]` (1-based, inclusive) of the class.
      */
     private predicate generatedLineRange(int start, int end) {
       start = this.getFirstWrite().getLocation().getStartLine() and
