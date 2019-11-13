@@ -27,6 +27,10 @@ class XSSConfig extends TaintTracking2::Configuration {
   override predicate isSanitizer(DataFlow::Node node) {
     node.getType() instanceof NumericType or node.getType() instanceof BooleanType
   }
+  
+  override predicate isAdditionalTaintStep(DataFlow::Node fromNode, DataFlow::Node toNode) {
+    any(JspTaintSteps::AdditionalTaintStep s).step(fromNode, toNode)
+  }
 }
 
 from DataFlow2::PathNode source, DataFlow2::PathNode sink, XSSConfig conf
