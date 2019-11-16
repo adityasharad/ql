@@ -105,7 +105,12 @@ class ProprietaryEvaluateCall extends MethodAccess {
 
 /** A reference to a JSP include parameter, as a source of remote user input. */
 class JspParamFlowSource extends RemoteFlowSource {
-  JspParamFlowSource() { this.asExpr().(StringLiteral).getValue().matches("${param.%}%") }
+  Generated::ExpressionLanguageExpr e;
+
+  JspParamFlowSource() {
+    this.asExpr() = e and
+    e.getExpressionLanguageString().getStringValue().matches("${param.%}%")
+  }
 
   override string getSourceType() { result = "JSP parameter" }
 }
@@ -170,7 +175,6 @@ module JspTaintSteps {
 
 private class JspAttributeRead extends Expr {
   Parameter requestParameter;
-
   string attributeName;
 
   JspAttributeRead() {
@@ -324,13 +328,17 @@ class JspContextGetOutMethod extends Method {
 }
 
 /** A data flow node that corresponds to a location in JSP code. */
-class JspDataFlowNode extends DataFlow::ExprNode {
+class JspDataFlowNode extends DataFlow::Node {
   Raw::JspElement jspElement;
-
   Generated::JavaElement javaElement;
 
   JspDataFlowNode() {
-    this.asExpr() = javaElement and
+    (
+      this.asExpr() = javaElement or
+      this.(DataFlow::PostUpdateNode).getPreUpdateNode().asExpr() = javaElement
+      // Not needed yet: at time of writing, no JavaElements are Parameters.
+      // or this.asParameter() = javaElement
+    ) and
     jspElement.getGeneratedCode() = javaElement
   }
 
@@ -481,17 +489,23 @@ private module Generated {
     override int getEndLineRelativeOffset() { result = count(this.getStringValue().indexOf("\n")) }
   }
 
-  class ExpressionLanguageExpr extends JavaElement, CompileTimeConstantExpr {
+  class ExpressionLanguageExpr extends JavaElement, Expr {
+    CompileTimeConstantExpr elString;
     MethodAccess proprietaryEvaluateCall;
+    JspWriteCall writeCall;
 
     ExpressionLanguageExpr() {
       writtenStmt = this.getEnclosingStmt() and
       proprietaryEvaluateCall.getMethod() instanceof ProprietaryEvaluateMethod and
-      this = proprietaryEvaluateCall.getArgument(0) and
+      elString = proprietaryEvaluateCall.getArgument(0) and
+      // This element is the argument of `write`, not the constant string.
+      // Doing so allows this element to be identified as an XSS sink.
+      this = writeCall.getAnArgument() and
       // The `proprietaryEvaluate` call flows into the argument of `write`.
-      DataFlow::localFlow(DataFlow::exprNode(proprietaryEvaluateCall),
-        DataFlow::exprNode(any(JspWriteCall c).getAnArgument()))
+      DataFlow::localFlow(DataFlow::exprNode(proprietaryEvaluateCall), DataFlow::exprNode(this))
     }
+
+    CompileTimeConstantExpr getExpressionLanguageString() { result = elString }
 
     override int getEndLineRelativeOffset() {
       // assumes these are never multiline
