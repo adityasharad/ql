@@ -24,6 +24,9 @@
                             <keepSources>true</keepSources>
                             <jspc>
                                 <compiler>modern</compiler>
+                                <mappedFile>true</mappedFile>
+                                <smapDumped>true</smapDumped>
+                                <smapSuppressed>false</smapSuppressed>
                             </jspc>
                         </configuration>
                     </execution>
