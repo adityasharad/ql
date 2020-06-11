@@ -4,9 +4,7 @@
  *              code execution.
  * @kind path-problem
  * @problem.severity error
- * @sub-severity high
- * @precision high
- * @id py/code-injection
+ * @id py/code-injection-local
  * @tags security
  *       external/owasp/owasp-a1
  *       external/cwe/cwe-094
@@ -21,11 +19,22 @@ import semmle.python.web.HttpRequest
 /* Sinks */
 import semmle.python.security.injection.Exec
 
+/** A call to the builtin function `input`, viewed as a source of untrusted input. */
+class LocalInputSource extends TaintTracking::Source {
+    LocalInputSource() {
+        this = Value::named("input").getACall()
+    }
+    override predicate isSourceOf(TaintKind kind) {
+        kind instanceof ExternalStringKind
+    }
+}
+
 class CodeInjectionConfiguration extends TaintTracking::Configuration {
     CodeInjectionConfiguration() { this = "Code injection configuration" }
 
     override predicate isSource(TaintTracking::Source source) {
-        source instanceof HttpRequestTaintSource
+        source instanceof HttpRequestTaintSource or
+        source instanceof LocalInputSource
     }
 
     override predicate isSink(TaintTracking::Sink sink) { sink instanceof StringEvaluationNode }
