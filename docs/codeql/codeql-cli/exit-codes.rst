@@ -67,6 +67,21 @@ A fatal internal error occurred.
 This should be considered a bug. The CLI usually writes an abbreviated error description to stderr.
 If you can reproduce the bug, it's helpful to use ``--logdir`` and send the log files to GitHub in a bug report.
 
+137
+---
+
+On POSIX-compliant systems, this means the operating system sent signal 9, known as ``SIGKILL``, and terminated the CodeQL process.
+
+One situation where this may arise is when the system does not have enough available memory for CodeQL to run
+alongside other processes on the machine.
+In this case, the system's out-of-memory (OOM) killer sends the ``SIGKILL` signal to terminate the CodeQL process.
+
+If you encounter this error, consider either using the ``--ram`` option to reduce the amount of memory passed to CodeQL,
+or using a machine with more available memory.
+
+If the problem persists, this should be considered a bug:
+please use ``--logdir`` and send the log files to GitHub in a bug report.
+
 Other
 -----
 
